@@ -2312,7 +2312,6 @@ dependencies = [
 [[package]]
 name = "cpal"
 version = "0.18.0"
-source = "git+https://github.com/divanshu-go/screenpipe-cpal.git?rev=070548661878f0aac2d1c2ba445ef2d6ed18705f#070548661878f0aac2d1c2ba445ef2d6ed18705f"
 dependencies = [
  "alsa",
  "block2 0.6.2",
@@ -2336,7 +2335,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "web-sys",
  "windows 0.62.2",
- "windows-core 0.61.2",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
