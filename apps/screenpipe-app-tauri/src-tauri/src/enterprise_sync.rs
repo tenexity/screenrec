@@ -378,9 +378,10 @@ mod imp {
     // ─── Spawn ─────────────────────────────────────────────────────────
 
     /// Spawn the enterprise telemetry sync task. No-op (returns None) when
-    /// required env (`SCREENPIPE_ENTERPRISE_LICENSE_KEY`) is missing — this is
-    /// the path for a developer running an enterprise build locally without
-    /// pointing at a real ingest.
+    /// required env (`TENEXITY_CAPTURE_DEVICE_KEY` or legacy
+    /// `SCREENPIPE_ENTERPRISE_LICENSE_KEY`) is missing — this is the path for a
+    /// developer running an enterprise build locally without pointing at a real
+    /// ingest.
     pub fn spawn(app: &tauri::AppHandle) -> Option<tokio::sync::watch::Sender<bool>> {
         use tauri::Manager;
 
@@ -399,7 +400,7 @@ mod imp {
             Some(c) => c,
             None => {
                 info!(
-                    "enterprise sync: SCREENPIPE_ENTERPRISE_LICENSE_KEY not set, skipping"
+                    "enterprise sync: TENEXITY_CAPTURE_DEVICE_KEY not set, skipping"
                 );
                 return None;
             }

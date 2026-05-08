@@ -1,0 +1,6 @@
+{
+  "license_key": "replace-with-per-device-secret",
+  "project_id": "replace-with-tenexity-project-id",
+  "api_url": "https://api.tenexity.ai",
+  "retention_days": 30
+}

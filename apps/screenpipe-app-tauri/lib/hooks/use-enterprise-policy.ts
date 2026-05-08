@@ -43,6 +43,8 @@ const ENTERPRISE_DEFAULT_HIDDEN = ["account", "referral"];
 const POLL_INTERVAL_MS = 5 * 60 * 1000;
 
 const CACHE_KEY = "enterprise-policy-cache";
+const TENEXITY_WORKFLOW_CAPTURE_API =
+  "https://api.tenexity.ai/api/workflow-capture";
 
 /**
  * Fire-and-forget heartbeat to report device status to the enterprise API.
@@ -77,10 +79,12 @@ async function sendHeartbeat(licenseKey: string): Promise<void> {
       pipeStatuses = await gatherPipeStatuses();
     } catch {}
 
-    await tauriFetch("https://screenpi.pe/api/enterprise/heartbeat", {
+    await tauriFetch(`${TENEXITY_WORKFLOW_CAPTURE_API}/heartbeat`, {
       method: "POST",
       headers: {
         "X-License-Key": licenseKey,
+        "X-Device-Key": licenseKey,
+        "X-Device-Id": deviceId,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
@@ -119,9 +123,9 @@ type FetchResult =
  * Consumer builds: returns a no-op — isSectionHidden always returns false,
  * no Rust commands or network calls are made.
  *
- * Enterprise builds: reads the license key from `enterprise.json` (pushed via
+ * Enterprise builds: reads the device key from `enterprise.json` (pushed via
  * Intune/MDM, or entered manually via in-app prompt), fetches the policy from
- * the screenpipe API, and exposes which sections/settings to hide.
+ * the Tenexity workflow capture API, and exposes which sections/settings to hide.
  * Re-fetches every 5 minutes. Caches in localStorage for offline resilience.
  *
  * If no license key is found (or the saved key is invalid), sets
@@ -146,9 +150,13 @@ export function useEnterprisePolicy() {
         deviceId = (settings.deviceId as string) || "unknown";
       } catch {}
 
-      const res = await tauriFetch("https://screenpi.pe/api/enterprise/policy", {
+      const res = await tauriFetch(`${TENEXITY_WORKFLOW_CAPTURE_API}/policy`, {
         method: "GET",
-        headers: { "X-License-Key": licenseKey, "X-Device-Id": deviceId },
+        headers: {
+          "X-License-Key": licenseKey,
+          "X-Device-Key": licenseKey,
+          "X-Device-Id": deviceId,
+        },
       });
       if (res.status === 401 || res.status === 402) {
         console.error(`[enterprise] policy fetch: key rejected (${res.status})`);

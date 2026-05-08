@@ -5,10 +5,9 @@
 //! Enterprise telemetry sync.
 //!
 //! Periodically pulls new screen + audio + UI activity from the local screenpipe
-//! API and POSTs it as JSONL to the screenpipe enterprise ingest endpoint,
-//! authenticated with an org license key. Server-side it lands in R2 under
-//! `enterprise-telemetry/{license_id}/{device_id}/{ts}.jsonl` and feeds the
-//! org's admin chat dashboard.
+//! API and POSTs it as JSONL to the enterprise ingest endpoint. Tenexity builds
+//! use `TENEXITY_CAPTURE_*` configuration and keep the legacy screenpipe env
+//! names as fallbacks for compatibility.
 //!
 //! This module is **only compiled into enterprise builds** (gated by the
 //! `enterprise-build` Cargo feature).
@@ -33,7 +32,7 @@
 //! - **Graceful shutdown** — task respects cancellation token, drains in flight
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
@@ -57,9 +56,12 @@ const BACKOFF_MAX: Duration = Duration::from_secs(60 * 60);
 /// retrying every interval.
 const RETRY_AFTER_AUTH_FAIL: Duration = Duration::from_secs(60 * 60);
 
-/// Default endpoint. Overridable via `SCREENPIPE_ENTERPRISE_INGEST_URL` for
-/// staging / on-prem.
+/// Legacy screenpipe endpoint. Overridable via `SCREENPIPE_ENTERPRISE_INGEST_URL`.
 pub const DEFAULT_INGEST_URL: &str = "https://screenpi.pe/api/enterprise/ingest";
+
+/// Tenexity-owned workflow capture endpoint. Overridable via
+/// `TENEXITY_CAPTURE_INGEST_URL` or `TENEXITY_CAPTURE_API_URL`.
+pub const DEFAULT_TENEXITY_INGEST_URL: &str = "https://api.tenexity.ai/api/workflow-capture/ingest";
 
 /// Cursor file in app data dir.
 pub const CURSOR_FILENAME: &str = "enterprise_sync_cursor.json";
@@ -68,33 +70,126 @@ pub const CURSOR_FILENAME: &str = "enterprise_sync_cursor.json";
 
 #[derive(Debug, Clone)]
 pub struct EnterpriseSyncConfig {
-    /// `X-License-Key` value sent on every ingest request.
+    /// Device credential sent as `X-Device-Key` and legacy `X-License-Key`.
     pub license_key: String,
+    /// Optional Tenexity project binding. Sent as `X-Project-Id` so a managed
+    /// device can self-register on first policy/ingest contact.
+    pub project_id: Option<String>,
     /// Stable identifier for this physical device (e.g. machine UUID).
     pub device_id: String,
     /// Hostname / friendly device name (for the admin to recognize).
     pub device_label: String,
-    /// Ingest endpoint URL. Defaults to `DEFAULT_INGEST_URL`.
+    /// Ingest endpoint URL.
     pub ingest_url: String,
     /// Where to persist the cursor (typically the app data dir).
     pub cursor_path: PathBuf,
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+struct EnterpriseFileConfig {
+    /// Existing enterprise.json key used by the UI policy hook.
+    license_key: Option<String>,
+    /// Tenexity-specific alias for the same secret.
+    device_key: Option<String>,
+    tenexity_capture_device_key: Option<String>,
+    project_id: Option<String>,
+    tenexity_capture_project_id: Option<String>,
+    api_url: Option<String>,
+    tenexity_capture_api_url: Option<String>,
+    ingest_url: Option<String>,
+    tenexity_capture_ingest_url: Option<String>,
+}
+
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.and_then(|s| {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn first_non_empty(values: impl IntoIterator<Item = Option<String>>) -> Option<String> {
+    values.into_iter().find_map(non_empty)
+}
+
+fn read_enterprise_file_config(app_data_dir: &Path) -> EnterpriseFileConfig {
+    let mut paths = Vec::new();
+    paths.push(app_data_dir.join("enterprise.json"));
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            paths.push(exe_dir.join("enterprise.json"));
+            paths.push(exe_dir.join("../Resources/enterprise.json"));
+        }
+    }
+
+    for path in paths {
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        match serde_json::from_str::<EnterpriseFileConfig>(&raw) {
+            Ok(cfg) => return cfg,
+            Err(e) => warn!("enterprise sync: failed to parse {}: {}", path.display(), e),
+        }
+    }
+
+    EnterpriseFileConfig::default()
+}
+
 impl EnterpriseSyncConfig {
     /// Build config from env vars + the OS device id. Returns `None` when
-    /// required env (`SCREENPIPE_ENTERPRISE_LICENSE_KEY`) is missing — caller
-    /// should silently skip sync in that case.
-    pub fn from_env(app_data_dir: PathBuf, device_id: String, device_label: String) -> Option<Self> {
-        let license_key = std::env::var("SCREENPIPE_ENTERPRISE_LICENSE_KEY")
-            .ok()
-            .filter(|s| !s.trim().is_empty())?;
-        let ingest_url = std::env::var("SCREENPIPE_ENTERPRISE_INGEST_URL")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| DEFAULT_INGEST_URL.to_string());
+    /// required env (`TENEXITY_CAPTURE_DEVICE_KEY` or legacy
+    /// `SCREENPIPE_ENTERPRISE_LICENSE_KEY`) is missing — caller should
+    /// silently skip sync in that case.
+    pub fn from_env(
+        app_data_dir: PathBuf,
+        device_id: String,
+        device_label: String,
+    ) -> Option<Self> {
+        let file_cfg = read_enterprise_file_config(&app_data_dir);
+        let tenexity_device_key = first_non_empty([
+            std::env::var("TENEXITY_CAPTURE_DEVICE_KEY").ok(),
+            file_cfg.tenexity_capture_device_key.clone(),
+            file_cfg.device_key.clone(),
+        ]);
+        let legacy_license_key = first_non_empty([
+            std::env::var("SCREENPIPE_ENTERPRISE_LICENSE_KEY").ok(),
+            file_cfg.license_key.clone(),
+        ]);
+        let uses_tenexity_config = tenexity_device_key.is_some();
+        let license_key = tenexity_device_key.or(legacy_license_key)?;
+        let ingest_url = first_non_empty([
+            std::env::var("TENEXITY_CAPTURE_INGEST_URL").ok(),
+            file_cfg.tenexity_capture_ingest_url.clone(),
+            file_cfg.ingest_url.clone(),
+        ])
+        .or_else(|| {
+            first_non_empty([
+                std::env::var("TENEXITY_CAPTURE_API_URL").ok(),
+                file_cfg.tenexity_capture_api_url.clone(),
+                file_cfg.api_url.clone(),
+            ])
+            .map(|base| format!("{}/api/workflow-capture/ingest", base.trim_end_matches('/')))
+        })
+        .or_else(|| first_non_empty([std::env::var("SCREENPIPE_ENTERPRISE_INGEST_URL").ok()]))
+        .unwrap_or_else(|| {
+            if uses_tenexity_config {
+                DEFAULT_TENEXITY_INGEST_URL.to_string()
+            } else {
+                DEFAULT_INGEST_URL.to_string()
+            }
+        });
+        let project_id = first_non_empty([
+            std::env::var("TENEXITY_CAPTURE_PROJECT_ID").ok(),
+            file_cfg.tenexity_capture_project_id,
+            file_cfg.project_id,
+        ]);
         let cursor_path = app_data_dir.join(CURSOR_FILENAME);
         Some(Self {
             license_key,
+            project_id,
             device_id,
             device_label,
             ingest_url,
@@ -137,7 +232,10 @@ impl Cursor {
             },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Cursor::default(),
             Err(e) => {
-                warn!("enterprise sync: cursor read failed ({}), restarting backfill", e);
+                warn!(
+                    "enterprise sync: cursor read failed ({}), restarting backfill",
+                    e
+                );
                 Cursor::default()
             }
         }
@@ -200,9 +298,7 @@ pub trait LocalApiClient: Send + Sync {
     /// implementation chose to skip (e.g. the latest frame is identical
     /// to the previously snapshotted one). Default returns None — shims
     /// that don't support image fetching just don't sync screenshots.
-    async fn fetch_latest_snapshot(
-        &self,
-    ) -> Result<Option<SnapshotRow>, EnterpriseSyncError> {
+    async fn fetch_latest_snapshot(&self) -> Result<Option<SnapshotRow>, EnterpriseSyncError> {
         Ok(None)
     }
 }
@@ -334,8 +430,9 @@ pub fn build_jsonl(
     ui: &[UiEventRow],
     snapshots: &[SnapshotRow],
 ) -> Vec<u8> {
-    let mut out =
-        Vec::with_capacity((frames.len() + audio.len() + ui.len()) * 256 + snapshots.len() * 50_000);
+    let mut out = Vec::with_capacity(
+        (frames.len() + audio.len() + ui.len()) * 256 + snapshots.len() * 50_000,
+    );
     for f in frames {
         let rec = TelemetryRecord::Frame {
             device_id: device_id.to_string(),
@@ -425,13 +522,24 @@ pub async fn post_jsonl(
     client: &reqwest::Client,
     url: &str,
     license_key: &str,
+    device_id: &str,
+    device_label: &str,
+    project_id: Option<&str>,
     body: Vec<u8>,
 ) -> Result<(), EnterpriseSyncError> {
-    let resp = client
+    let mut request = client
         .post(url)
         .header("X-License-Key", license_key)
+        .header("X-Device-Key", license_key)
+        .header("X-Device-Id", device_id)
+        .header("X-Device-Label", device_label)
         .header("Content-Type", "application/x-ndjson")
-        .body(body)
+        .body(body);
+    if let Some(project_id) = project_id {
+        request = request.header("X-Project-Id", project_id);
+    }
+
+    let resp = request
         .send()
         .await
         .map_err(|e| EnterpriseSyncError::Ingest(e.to_string()))?;
@@ -440,9 +548,7 @@ pub async fn post_jsonl(
     if status.is_success() {
         return Ok(());
     }
-    if status == reqwest::StatusCode::UNAUTHORIZED
-        || status == reqwest::StatusCode::FORBIDDEN
-    {
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
         return Err(EnterpriseSyncError::IngestAuthRejected);
     }
     if status.is_server_error() {
@@ -534,7 +640,16 @@ pub async fn run_one_sync(
         &snapshots,
     );
     let bytes = body.len();
-    post_jsonl(http, &cfg.ingest_url, &cfg.license_key, body).await?;
+    post_jsonl(
+        http,
+        &cfg.ingest_url,
+        &cfg.license_key,
+        &cfg.device_id,
+        &cfg.device_label,
+        cfg.project_id.as_deref(),
+        body,
+    )
+    .await?;
 
     // Advance cursor only on success — partial failure must not skip records.
     if let Some(latest) = frames.last() {
@@ -794,7 +909,12 @@ mod tests {
             "host",
             &[],
             &[],
-            &[ui_event(99, "2026-05-07T10:01:00Z", "Salesforce", "Submit Quote")],
+            &[ui_event(
+                99,
+                "2026-05-07T10:01:00Z",
+                "Salesforce",
+                "Submit Quote",
+            )],
             &[],
         );
         let s = String::from_utf8(body).unwrap();
@@ -866,56 +986,104 @@ mod tests {
         // Snapshot prior env so we don't leak state into other tests.
         let prior_license = std::env::var("SCREENPIPE_ENTERPRISE_LICENSE_KEY").ok();
         let prior_url = std::env::var("SCREENPIPE_ENTERPRISE_INGEST_URL").ok();
+        let prior_tenexity_key = std::env::var("TENEXITY_CAPTURE_DEVICE_KEY").ok();
+        let prior_tenexity_ingest = std::env::var("TENEXITY_CAPTURE_INGEST_URL").ok();
+        let prior_tenexity_api = std::env::var("TENEXITY_CAPTURE_API_URL").ok();
+        let prior_tenexity_project = std::env::var("TENEXITY_CAPTURE_PROJECT_ID").ok();
 
         // Case 1: no license env → None.
         std::env::remove_var("SCREENPIPE_ENTERPRISE_LICENSE_KEY");
+        std::env::remove_var("TENEXITY_CAPTURE_DEVICE_KEY");
+        std::env::remove_var("TENEXITY_CAPTURE_INGEST_URL");
+        std::env::remove_var("TENEXITY_CAPTURE_API_URL");
+        std::env::remove_var("TENEXITY_CAPTURE_PROJECT_ID");
         let dir = TempDir::new().unwrap();
         assert!(
-            EnterpriseSyncConfig::from_env(
-                dir.path().to_path_buf(),
-                "dev".into(),
-                "host".into()
-            )
-            .is_none(),
+            EnterpriseSyncConfig::from_env(dir.path().to_path_buf(), "dev".into(), "host".into())
+                .is_none(),
             "missing license env must yield None"
         );
 
         // Case 2: blank license env → None.
         std::env::set_var("SCREENPIPE_ENTERPRISE_LICENSE_KEY", "   ");
+        std::env::set_var("TENEXITY_CAPTURE_DEVICE_KEY", "   ");
         let dir = TempDir::new().unwrap();
         assert!(
-            EnterpriseSyncConfig::from_env(
-                dir.path().to_path_buf(),
-                "dev".into(),
-                "host".into()
-            )
-            .is_none(),
+            EnterpriseSyncConfig::from_env(dir.path().to_path_buf(), "dev".into(), "host".into())
+                .is_none(),
             "blank license env must yield None"
         );
 
         // Case 3: license set, ingest url unset → default url.
         std::env::set_var("SCREENPIPE_ENTERPRISE_LICENSE_KEY", "sek_test");
+        std::env::remove_var("TENEXITY_CAPTURE_DEVICE_KEY");
         std::env::remove_var("SCREENPIPE_ENTERPRISE_INGEST_URL");
         let dir = TempDir::new().unwrap();
-        let cfg = EnterpriseSyncConfig::from_env(
-            dir.path().to_path_buf(),
-            "dev".into(),
-            "host".into(),
-        )
-        .expect("license set, must yield Some");
+        let cfg =
+            EnterpriseSyncConfig::from_env(dir.path().to_path_buf(), "dev".into(), "host".into())
+                .expect("license set, must yield Some");
         assert_eq!(cfg.ingest_url, DEFAULT_INGEST_URL);
         assert_eq!(cfg.license_key, "sek_test");
+        assert_eq!(cfg.project_id, None);
 
         // Case 4: ingest url override is respected.
         std::env::set_var("SCREENPIPE_ENTERPRISE_INGEST_URL", "https://staging/ingest");
         let dir = TempDir::new().unwrap();
-        let cfg = EnterpriseSyncConfig::from_env(
-            dir.path().to_path_buf(),
-            "dev".into(),
-            "host".into(),
+        let cfg =
+            EnterpriseSyncConfig::from_env(dir.path().to_path_buf(), "dev".into(), "host".into())
+                .unwrap();
+        assert_eq!(cfg.ingest_url, "https://staging/ingest");
+
+        // Case 5: Tenexity device key selects Tenexity defaults and project id.
+        std::env::set_var("TENEXITY_CAPTURE_DEVICE_KEY", "ten_dev");
+        std::env::set_var("TENEXITY_CAPTURE_PROJECT_ID", "42");
+        std::env::remove_var("SCREENPIPE_ENTERPRISE_INGEST_URL");
+        let dir = TempDir::new().unwrap();
+        let cfg =
+            EnterpriseSyncConfig::from_env(dir.path().to_path_buf(), "dev".into(), "host".into())
+                .unwrap();
+        assert_eq!(cfg.license_key, "ten_dev");
+        assert_eq!(cfg.project_id.as_deref(), Some("42"));
+        assert_eq!(cfg.ingest_url, DEFAULT_TENEXITY_INGEST_URL);
+
+        // Case 6: Tenexity API base expands to the ingest path.
+        std::env::set_var("TENEXITY_CAPTURE_API_URL", "https://api.example.com/");
+        let dir = TempDir::new().unwrap();
+        let cfg =
+            EnterpriseSyncConfig::from_env(dir.path().to_path_buf(), "dev".into(), "host".into())
+                .unwrap();
+        assert_eq!(
+            cfg.ingest_url,
+            "https://api.example.com/api/workflow-capture/ingest"
+        );
+
+        // Case 7: enterprise.json can configure managed deployments without
+        // machine-wide environment variables.
+        std::env::remove_var("TENEXITY_CAPTURE_DEVICE_KEY");
+        std::env::remove_var("TENEXITY_CAPTURE_PROJECT_ID");
+        std::env::remove_var("TENEXITY_CAPTURE_API_URL");
+        std::env::remove_var("TENEXITY_CAPTURE_INGEST_URL");
+        std::env::remove_var("SCREENPIPE_ENTERPRISE_LICENSE_KEY");
+        std::env::remove_var("SCREENPIPE_ENTERPRISE_INGEST_URL");
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("enterprise.json"),
+            r#"{
+              "license_key": "file_dev",
+              "project_id": "314",
+              "api_url": "https://capture.example.com"
+            }"#,
         )
         .unwrap();
-        assert_eq!(cfg.ingest_url, "https://staging/ingest");
+        let cfg =
+            EnterpriseSyncConfig::from_env(dir.path().to_path_buf(), "dev".into(), "host".into())
+                .unwrap();
+        assert_eq!(cfg.license_key, "file_dev");
+        assert_eq!(cfg.project_id.as_deref(), Some("314"));
+        assert_eq!(
+            cfg.ingest_url,
+            "https://capture.example.com/api/workflow-capture/ingest"
+        );
 
         // Restore prior state so we don't pollute other tests / the process.
         match prior_license {
@@ -925,6 +1093,22 @@ mod tests {
         match prior_url {
             Some(v) => std::env::set_var("SCREENPIPE_ENTERPRISE_INGEST_URL", v),
             None => std::env::remove_var("SCREENPIPE_ENTERPRISE_INGEST_URL"),
+        }
+        match prior_tenexity_key {
+            Some(v) => std::env::set_var("TENEXITY_CAPTURE_DEVICE_KEY", v),
+            None => std::env::remove_var("TENEXITY_CAPTURE_DEVICE_KEY"),
+        }
+        match prior_tenexity_ingest {
+            Some(v) => std::env::set_var("TENEXITY_CAPTURE_INGEST_URL", v),
+            None => std::env::remove_var("TENEXITY_CAPTURE_INGEST_URL"),
+        }
+        match prior_tenexity_api {
+            Some(v) => std::env::set_var("TENEXITY_CAPTURE_API_URL", v),
+            None => std::env::remove_var("TENEXITY_CAPTURE_API_URL"),
+        }
+        match prior_tenexity_project {
+            Some(v) => std::env::set_var("TENEXITY_CAPTURE_PROJECT_ID", v),
+            None => std::env::remove_var("TENEXITY_CAPTURE_PROJECT_ID"),
         }
     }
 
@@ -984,6 +1168,7 @@ mod tests {
     fn test_cfg(dir: &TempDir, ingest_url: String) -> EnterpriseSyncConfig {
         EnterpriseSyncConfig {
             license_key: "sek_test".to_string(),
+            project_id: None,
             device_id: "dev-1".to_string(),
             device_label: "louis-mbp".to_string(),
             ingest_url,
@@ -998,11 +1183,13 @@ mod tests {
         let mut cursor = Cursor {
             last_frame_ts: Some("2026-05-07T10:00:00Z".to_string()),
             last_audio_ts: Some("2026-05-07T10:00:00Z".to_string()),
-        last_ui_ts: Some("2026-05-07T10:00:00Z".to_string()),
+            last_ui_ts: Some("2026-05-07T10:00:00Z".to_string()),
         };
         let local = MockLocal::new(vec![vec![]], vec![vec![]]);
         let http = reqwest::Client::new();
-        let report = run_one_sync(&cfg, &mut cursor, &local, &http).await.unwrap();
+        let report = run_one_sync(&cfg, &mut cursor, &local, &http)
+            .await
+            .unwrap();
         assert_eq!(report, SyncTickReport::default());
         assert_eq!(
             cursor.last_frame_ts.as_deref(),
@@ -1017,7 +1204,9 @@ mod tests {
         let mut cursor = Cursor::default();
         let local = MockLocal::new(vec![vec![]], vec![vec![]]);
         let http = reqwest::Client::new();
-        run_one_sync(&cfg, &mut cursor, &local, &http).await.unwrap();
+        run_one_sync(&cfg, &mut cursor, &local, &http)
+            .await
+            .unwrap();
         // Cursor is now seeded — second tick uses it as the `since`.
         let frames_since = local.last_frames_since.lock().unwrap().clone().unwrap();
         let parsed: chrono::DateTime<chrono::Utc> =
@@ -1046,7 +1235,7 @@ mod tests {
         let mut cursor = Cursor {
             last_frame_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_audio_ts: Some("2026-05-07T09:00:00Z".to_string()),
-        last_ui_ts: Some("2026-05-07T09:00:00Z".to_string()),
+            last_ui_ts: Some("2026-05-07T09:00:00Z".to_string()),
         };
         let local = MockLocal::new(
             vec![vec![
@@ -1056,7 +1245,9 @@ mod tests {
             vec![vec![audio(1, "2026-05-07T10:00:15Z", "yo")]],
         );
         let http = reqwest::Client::new();
-        let report = run_one_sync(&cfg, &mut cursor, &local, &http).await.unwrap();
+        let report = run_one_sync(&cfg, &mut cursor, &local, &http)
+            .await
+            .unwrap();
         assert_eq!(report.frames, 2);
         assert_eq!(report.audio, 1);
         assert_eq!(
@@ -1085,7 +1276,7 @@ mod tests {
         let mut cursor = Cursor {
             last_frame_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_audio_ts: Some("2026-05-07T09:00:00Z".to_string()),
-        last_ui_ts: Some("2026-05-07T09:00:00Z".to_string()),
+            last_ui_ts: Some("2026-05-07T09:00:00Z".to_string()),
         };
         let local = MockLocal::new(
             vec![vec![frame(1, "2026-05-07T10:00:00Z", "Arc", "x")]],
@@ -1116,7 +1307,7 @@ mod tests {
         let mut cursor = Cursor {
             last_frame_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_audio_ts: Some("2026-05-07T09:00:00Z".to_string()),
-        last_ui_ts: Some("2026-05-07T09:00:00Z".to_string()),
+            last_ui_ts: Some("2026-05-07T09:00:00Z".to_string()),
         };
         let local = MockLocal::new(
             vec![vec![frame(1, "2026-05-07T10:00:00Z", "Arc", "x")]],
@@ -1126,10 +1317,7 @@ mod tests {
         let err = run_one_sync(&cfg, &mut cursor, &local, &http)
             .await
             .unwrap_err();
-        assert!(matches!(
-            err,
-            EnterpriseSyncError::IngestServerError(503)
-        ));
+        assert!(matches!(err, EnterpriseSyncError::IngestServerError(503)));
         // Cursor must NOT advance on failure.
         assert_eq!(
             cursor.last_frame_ts.as_deref(),
@@ -1156,14 +1344,16 @@ mod tests {
         let mut cursor = Cursor {
             last_frame_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_audio_ts: Some("2026-05-07T09:00:00Z".to_string()),
-        last_ui_ts: Some("2026-05-07T09:00:00Z".to_string()),
+            last_ui_ts: Some("2026-05-07T09:00:00Z".to_string()),
         };
         let local = MockLocal::new(
             vec![vec![frame(1, "2026-05-07T10:00:00Z", "Arc", "x")]],
             vec![vec![]],
         );
         let http = reqwest::Client::new();
-        run_one_sync(&cfg, &mut cursor, &local, &http).await.unwrap();
+        run_one_sync(&cfg, &mut cursor, &local, &http)
+            .await
+            .unwrap();
         // Mock asserts call shape on drop.
     }
 }

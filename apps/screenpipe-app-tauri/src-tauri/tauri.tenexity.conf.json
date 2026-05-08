@@ -1,0 +1,100 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Tenexity Workflow Capture",
+  "identifier": "ai.tenexity.workflow-capture",
+  "build": {
+    "beforeDevCommand": "bun run dev",
+    "beforeBuildCommand": "bun run build",
+    "frontendDist": "../out",
+    "devUrl": "http://localhost:3000"
+  },
+  "bundle": {
+    "createUpdaterArtifacts": false,
+    "active": true,
+    "publisher": "Tenexity",
+    "category": "Business",
+    "shortDescription": "Managed workflow evidence capture for Tenexity deployments",
+    "longDescription": "Tenexity Workflow Capture records screen, audio, OCR, and UI activity from managed client workstations so Tenexity can understand real workflows and train process agents.",
+    "copyright": "Copyright Tenexity",
+    "targets": [
+      "app",
+      "dmg",
+      "deb",
+      "appimage",
+      "nsis"
+    ],
+    "externalBin": [
+      "bun"
+    ],
+    "icon": [
+      "icons/tenexity/32x32.png",
+      "icons/tenexity/128x128.png",
+      "icons/tenexity/128x128@2x.png",
+      "icons/tenexity/256x256.png",
+      "icons/tenexity/512x512.png",
+      "icons/tenexity/1024x1024.png",
+      "icons/tenexity/icon.ico",
+      "icons/tenexity/icon.png"
+    ],
+    "resources": [
+      "assets/*"
+    ],
+    "macOS": {
+      "entitlements": "entitlements.plist"
+    },
+    "windows": {
+      "signCommand": "powershell -ExecutionPolicy Bypass -File sign-ssl.ps1 %1",
+      "nsis": {
+        "installMode": "perMachine",
+        "headerImage": "assets/nsis-header.bmp",
+        "sidebarImage": "assets/nsis-sidebar.bmp",
+        "installerIcon": "icons/tenexity/icon.ico",
+        "installerHooks": "windows/hooks.nsh"
+      },
+      "webviewInstallMode": {
+        "type": "skip"
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [],
+      "pubkey": ""
+    },
+    "deep-link": {
+      "desktop": {
+        "schemes": [
+          "tenexity-workflow-capture"
+        ]
+      },
+      "mobile": [
+        {
+          "host": "framework.tenexity.ai",
+          "pathPrefix": [
+            "/console/workflow-capture"
+          ]
+        }
+      ]
+    }
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "trayIcon": {
+      "id": "tenexity_workflow_capture",
+      "iconPath": "assets/tenexity-logo-tray-white.png",
+      "iconAsTemplate": true,
+      "menuOnLeftClick": true
+    },
+    "security": {
+      "assetProtocol": {
+        "enable": true,
+        "scope": [
+          "$APPDATA/**",
+          "$HOME/.screenpipe/**"
+        ]
+      },
+      "csp": null
+    },
+    "macOSPrivateApi": true
+  }
+}
