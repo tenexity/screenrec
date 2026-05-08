@@ -251,18 +251,27 @@ jobs:
             Write-Host "Tauri signature regenerated"
           }
 
-      - name: Create .intunewin and upload to R2
+      - name: Create .intunewin and upload to R2 when configured
         shell: powershell
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           cd apps/screenpipe-app-tauri
           $intunewinPath = $null
           try { .\scripts\exe-to-intunewin.ps1 } catch { Write-Host ".intunewin creation failed: $_" }
           $intunewin = Get-ChildItem "scripts\intunewin\out\*.intunewin" -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($intunewin) { $intunewinPath = $intunewin.FullName }
+
+          $r2Configured = -not [string]::IsNullOrWhiteSpace($env:AWS_ACCESS_KEY_ID) -and
+            -not [string]::IsNullOrWhiteSpace($env:AWS_SECRET_ACCESS_KEY) -and
+            -not [string]::IsNullOrWhiteSpace($env:CLOUDFLARE_ACCOUNT_ID)
+          if (-not $r2Configured) {
+            Write-Host "R2 upload skipped because one or more R2 secrets are not configured."
+            return
+          }
 
           if (-not (Get-Command aws -ErrorAction SilentlyContinue)) {
             Write-Host "Installing AWS CLI..."
@@ -293,9 +302,11 @@ jobs:
       - name: Upload enterprise NSIS installer (artifact)
         uses: actions/upload-artifact@v4
         with:
-          name: enterprise-windows-x64
+          name: ${{ inputs.release_profile }}-windows-x64
           path: |
             apps/screenpipe-app-tauri/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+            apps/screenpipe-app-tauri/scripts/intunewin/out/*.intunewin
+          if-no-files-found: error
 
   # ─── macOS Apple Silicon ──────────────────────────────────────────────────
   release-enterprise-macos:
