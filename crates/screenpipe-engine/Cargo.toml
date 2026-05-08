@@ -189,3 +189,6 @@ socket2 = "0.5"
 [target.'cfg(target_os = "macos")'.dependencies]
 cidre = { git = "https://github.com/yury/cidre.git", features = ["ax", "ns", "av", "blocks"] }
 tracing-oslog = { workspace = true }
+
+[package.metadata.cargo-machete]
+ignored = ["screenpipe-redact"]
