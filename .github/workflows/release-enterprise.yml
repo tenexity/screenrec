@@ -11,6 +11,23 @@ name: Release Enterprise
 
 on:
   workflow_dispatch:
+    inputs:
+      release_profile:
+        description: "Which app branding/config to build"
+        required: true
+        default: "enterprise"
+        type: choice
+        options:
+          - enterprise
+          - tenexity
+      platforms:
+        description: "Platforms to build"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - windows
 
 env:
   GIT_LFS_SKIP_SMUDGE: 1
@@ -18,6 +35,7 @@ env:
 jobs:
   # ─── Windows x64 ──────────────────────────────────────────────────────────
   release-enterprise-windows:
+    if: ${{ inputs.platforms == 'all' || inputs.platforms == 'windows' }}
     runs-on: windows-2022
     timeout-minutes: 120
     steps:
@@ -148,9 +166,14 @@ jobs:
           echo "ORT_LIB_LOCATION=${{ github.workspace }}/ort-system-lib" >> $GITHUB_ENV
           echo "OPENBLAS_PATH=${{ github.workspace }}/apps/screenpipe-app-tauri/src-tauri/openblas" >> $GITHUB_ENV
 
-      - name: Use enterprise config
+      - name: Use release config
         shell: bash
-        run: cp apps/screenpipe-app-tauri/src-tauri/tauri.enterprise.conf.json apps/screenpipe-app-tauri/src-tauri/tauri.conf.json
+        run: |
+          if [ "${{ inputs.release_profile }}" = "tenexity" ]; then
+            cp apps/screenpipe-app-tauri/src-tauri/tauri.tenexity.conf.json apps/screenpipe-app-tauri/src-tauri/tauri.conf.json
+          else
+            cp apps/screenpipe-app-tauri/src-tauri/tauri.enterprise.conf.json apps/screenpipe-app-tauri/src-tauri/tauri.conf.json
+          fi
 
       - name: Install CodeSignTool for binary signing
         shell: powershell
@@ -276,6 +299,7 @@ jobs:
 
   # ─── macOS Apple Silicon ──────────────────────────────────────────────────
   release-enterprise-macos:
+    if: ${{ inputs.platforms == 'all' }}
     runs-on: macos-latest
     timeout-minutes: 120
     steps:
@@ -324,8 +348,13 @@ jobs:
         working-directory: apps/screenpipe-app-tauri
         run: bun ./scripts/pre_build.js
 
-      - name: Use enterprise config
-        run: cp apps/screenpipe-app-tauri/src-tauri/tauri.enterprise.conf.json apps/screenpipe-app-tauri/src-tauri/tauri.conf.json
+      - name: Use release config
+        run: |
+          if [ "${{ inputs.release_profile }}" = "tenexity" ]; then
+            cp apps/screenpipe-app-tauri/src-tauri/tauri.tenexity.conf.json apps/screenpipe-app-tauri/src-tauri/tauri.conf.json
+          else
+            cp apps/screenpipe-app-tauri/src-tauri/tauri.enterprise.conf.json apps/screenpipe-app-tauri/src-tauri/tauri.conf.json
+          fi
 
       - name: Import signing cert into build keychain
         shell: bash
