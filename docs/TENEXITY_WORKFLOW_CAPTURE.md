@@ -55,9 +55,10 @@ Release Tenexity Workflow Capture
 ```
 
 The workflow copies `tauri.tenexity.conf.json` to `tauri.conf.json`, builds the
-Windows x64 enterprise target, signs the NSIS installer with the existing
-SSL.com secrets, creates an Intune package, and uploads the installer,
-signature, `.intunewin`, and `tenexity.enterprise.example.json` as artifacts.
+Windows x64 enterprise target, creates an Intune package, and uploads the
+installer plus `.intunewin` as artifacts. When the SSL.com and Tauri signing
+secrets are configured, the same workflow signs the NSIS installer before
+upload; unsigned artifacts should stay limited to pilot validation.
 
 ## Current Evidence Stream
 
